@@ -48,11 +48,16 @@ def make_room(client, threshold=2, timeout=30, lines=("甲：你好。", "乙：
     return room_id
 
 
-def report(client, room_id, participant, seq, position):
+def report(client, room_id, participant, seq, position, epoch=None):
+    """演员上报；缺省从 /state 取当前进度代际（模拟正常客户端行为）。"""
+    if epoch is None:
+        resp = client.get(f"/rooms/{room_id}/state")
+        epoch = resp.json()["progress_epoch"] if resp.status_code == 200 else 0
     return client.post(f"/rooms/{room_id}/events", json={
         "participant_id": participant,
         "seq": seq,
         "position": position,
+        "progress_epoch": epoch,
     })
 
 
@@ -193,6 +198,7 @@ def test_reimport_lines_resets_progress(client):
         "lines_imported": 2,
         "progress_reset": True,
         "revision": 2,  # 首次导入为 1，整体替换再开启新版本
+        "progress_epoch": 2,  # 首次导入为 1，整体替换同样开启新代际
     }
 
     current = state(client, room_id)
@@ -698,3 +704,196 @@ def test_resume_with_zero_length_pause(client):
     assert active_ids(client, room_id) == ["actor-a"]
     client.clock.advance(1)
     assert active_ids(client, room_id) == []
+
+
+# ---------------------------------------------------------------------------
+# 导演校准公共位置（PUT /rooms/{room_id}/cursor）与进度代际
+# ---------------------------------------------------------------------------
+
+def jump(client, room_id, expected_progress_epoch, position):
+    return client.put(f"/rooms/{room_id}/cursor", json={
+        "expected_progress_epoch": expected_progress_epoch,
+        "position": position,
+    })
+
+
+def test_state_and_room_expose_progress_epoch(client):
+    room_id = make_room(client)
+    current = state(client, room_id)
+    assert current["progress_epoch"] == 1  # 首次导入台词已开启代际 1
+    assert client.get(f"/rooms/{room_id}").json()["progress_epoch"] == 1
+
+
+def test_cursor_jump_forward_and_backward(client):
+    room_id = make_room(client, threshold=2)
+    report(client, room_id, "actor-a", 1, 2)
+    report(client, room_id, "actor-b", 1, 2)
+    assert state(client, room_id)["public_position"] == 2
+
+    # 前跳到 4：代际递增，参与者进度清空
+    resp = jump(client, room_id, 1, 4)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["changed"] is True
+    assert body["public_position"] == 4
+    assert body["progress_epoch"] == 2
+    current = state(client, room_id)
+    assert current["public_position"] == 4
+    assert current["progress_epoch"] == 2
+    assert current["current_line"] == {"position": 4, "text": "甲：开始吧。"}
+    assert current["active_participants"] == []
+
+    # 回退到 1：导演校准允许回退，不受“绝不回退”约束
+    resp = jump(client, room_id, 2, 1)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["changed"] is True
+    assert body["public_position"] == 1
+    assert body["progress_epoch"] == 3
+    assert state(client, room_id)["public_position"] == 1
+
+
+def test_cursor_same_position_is_idempotent_noop(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 2)  # 公共位置推进到 2
+    assert jump(client, room_id, 1, 4).json()["changed"] is True  # 代际 -> 2
+    report(client, room_id, "actor-a", 2, 4)  # 新代际重新上报
+
+    # 目标即当前位置：幂等空操作，不递增代际、不清空参与者
+    resp = jump(client, room_id, 2, 4)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["changed"] is False
+    assert body["public_position"] == 4
+    assert body["progress_epoch"] == 2
+    current = state(client, room_id)
+    assert current["progress_epoch"] == 2
+    assert [p["participant_id"] for p in current["active_participants"]] == ["actor-a"]
+
+    # 即便携带过期代际，幂等空操作仍视为成功重试
+    resp = jump(client, room_id, 1, 4)
+    assert resp.status_code == 200
+    assert resp.json()["changed"] is False
+    assert state(client, room_id)["progress_epoch"] == 2
+
+
+def test_cursor_epoch_mismatch_returns_409_and_keeps_state(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 2)
+
+    resp = jump(client, room_id, 99, 4)
+    assert resp.status_code == 409, resp.text
+    current = state(client, room_id)
+    assert current["public_position"] == 2     # 公共位置不变
+    assert current["progress_epoch"] == 1      # 代际不变
+    assert [p["participant_id"] for p in current["active_participants"]] == ["actor-a"]
+
+    # 携带正确代际即可校准成功
+    assert jump(client, room_id, 1, 4).status_code == 200
+    assert state(client, room_id)["progress_epoch"] == 2
+
+
+def test_cursor_position_validation(client):
+    room_id = make_room(client)  # 5 行台词
+    assert jump(client, room_id, 1, 5).status_code == 422   # 越界（== 台词总数）
+    assert jump(client, room_id, 1, 99).status_code == 422
+    assert jump(client, room_id, 1, -1).status_code == 422  # schema 拒绝负数
+    current = state(client, room_id)
+    assert current["public_position"] == -1
+    assert current["progress_epoch"] == 1
+
+
+def test_cursor_before_lines_imported_rejected(client):
+    room_id = "room-" + uuid.uuid4().hex[:8]
+    client.post("/rooms", json={
+        "id": room_id, "name": "空房间",
+        "advance_threshold": 1, "offline_timeout_seconds": 30,
+    })
+    assert jump(client, room_id, 0, 0).status_code == 409
+
+
+def test_cursor_unknown_room_returns_404(client):
+    assert jump(client, "nope", 0, 0).status_code == 404
+
+
+def test_stale_epoch_events_rejected_after_jump(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 4)
+    assert state(client, room_id)["public_position"] == 4
+
+    # 导演回退到 1：开启新代际并清空参与者进度
+    assert jump(client, room_id, 1, 1).status_code == 200
+
+    # 旧代际的延迟/重试事件：409，且不能把房间重新推进到 4
+    resp = report(client, room_id, "actor-a", 2, 4, epoch=1)
+    assert resp.status_code == 409, resp.text
+    current = state(client, room_id)
+    assert current["public_position"] == 1
+    assert current["progress_epoch"] == 2
+    assert current["active_participants"] == []
+
+    # 新代际上报正常受理并推进
+    resp = report(client, room_id, "actor-a", 3, 3)
+    assert resp.status_code == 200
+    assert resp.json()["applied"] is True
+    assert state(client, room_id)["public_position"] == 3
+
+
+def test_cursor_jump_retry_is_safe(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 2)
+
+    # 客户端跳转成功后未收到响应，原样重试同一请求
+    first = jump(client, room_id, 1, 4)
+    assert first.status_code == 200
+    assert first.json()["changed"] is True
+    retry = jump(client, room_id, 1, 4)  # expected 已过期，但目标==当前 → 幂等
+    assert retry.status_code == 200
+    assert retry.json()["changed"] is False
+    assert state(client, room_id)["progress_epoch"] == 2
+
+
+def test_cursor_allowed_while_paused(client):
+    room_id = make_room(client, threshold=1, timeout=10)
+    report(client, room_id, "actor-a", 1, 2)
+    pause(client, room_id)
+
+    # 暂停期间导演仍可校准（演员上报仍被拒绝）
+    resp = jump(client, room_id, 1, 3)
+    assert resp.status_code == 200, resp.text
+    current = state(client, room_id)
+    assert current["paused"] is True
+    assert current["public_position"] == 3
+    assert current["progress_epoch"] == 2
+    assert report(client, room_id, "actor-b", 1, 3).status_code == 409  # 暂停拒绝
+
+    # 恢复后演员以新代际重新上报（参与者已被清空，序号重新计数）
+    resume(client, room_id, expected=1)
+    assert report(client, room_id, "actor-b", 1, 3).status_code == 200
+
+
+def test_import_lines_starts_new_progress_epoch(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 2)
+
+    resp = client.post(f"/rooms/{room_id}/lines", json={"lines": ["新台词一", "新台词二"]})
+    assert resp.json()["progress_epoch"] == 2
+    assert state(client, room_id)["progress_epoch"] == 2
+
+    # 导入前的旧代际事件不再受理；新代际正常上报
+    assert report(client, room_id, "actor-a", 2, 1, epoch=1).status_code == 409
+    assert report(client, room_id, "actor-a", 3, 1).status_code == 200
+
+
+def test_cursor_does_not_create_advancement_record(client):
+    room_id = make_room(client, threshold=2)
+    report(client, room_id, "actor-a", 1, 2)
+    report(client, room_id, "actor-b", 1, 2)
+    before = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert [a["position"] for a in before] == [2]
+
+    jump(client, room_id, 1, 4)
+    after = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert after == before  # 导演校准不产生推进记录
+    # last_advancement 仍指向最近一次 quorum 推进
+    assert state(client, room_id)["last_advancement"]["position"] == 2

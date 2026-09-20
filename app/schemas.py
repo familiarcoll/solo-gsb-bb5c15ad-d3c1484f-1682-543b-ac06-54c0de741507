@@ -38,11 +38,14 @@ class LinesImport(BaseModel):
 
 
 class EventReport(BaseModel):
-    """演员上报：参与者 ID、单调递增事件序号、已到达的台词位置。"""
+    """演员上报：参与者 ID、单调递增事件序号、已到达的台词位置、当前进度代际。"""
 
     participant_id: str = Field(min_length=1, max_length=100)
     seq: int = Field(ge=0, description="该参与者单调递增的事件序号")
     position: int = Field(ge=0, description="已到达的台词位置（从 0 开始）")
+    progress_epoch: int = Field(
+        ge=0, description="客户端已知的进度代际；与当前代际不一致时返回 409"
+    )
 
 
 class LineOperation(BaseModel):
@@ -82,3 +85,12 @@ class ClockUpdate(BaseModel):
         ge=0, description="客户端已知的 clock_version；与当前不一致时返回 409"
     )
     paused: bool = Field(description="目标状态：true 暂停排练，false 恢复排练")
+
+
+class CursorUpdate(BaseModel):
+    """导演校准公共位置：携带客户端已知的进度代际做乐观并发控制。"""
+
+    expected_progress_epoch: int = Field(
+        ge=0, description="客户端已知的 progress_epoch；与当前代际不一致时返回 409"
+    )
+    position: int = Field(ge=0, description="目标台词位置（从 0 开始），允许前跳或回退")

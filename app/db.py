@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS rooms (
     paused                 INTEGER NOT NULL DEFAULT 0,  -- 排练是否暂停
     clock_version          INTEGER NOT NULL DEFAULT 0,  -- 暂停/恢复每切换一次递增
     paused_at              REAL,                        -- 本次暂停开始的 epoch 秒
+    progress_epoch         INTEGER NOT NULL DEFAULT 0,  -- 进度代际：导演校准/台本导入每次递增
     created_at             REAL NOT NULL
 );
 
@@ -84,6 +85,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     - rooms.revision：台本版本号
     - rooms.paused / clock_version / paused_at：排练暂停/恢复时钟
+    - rooms.progress_epoch：进度代际（导演校准/台本导入开启新代际）
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(rooms)")}
     if "revision" not in columns:
@@ -101,4 +103,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "paused_at" not in columns:
         conn.execute(
             "ALTER TABLE rooms ADD COLUMN paused_at REAL"
+        )
+    if "progress_epoch" not in columns:
+        conn.execute(
+            "ALTER TABLE rooms ADD COLUMN progress_epoch INTEGER NOT NULL DEFAULT 0"
         )
