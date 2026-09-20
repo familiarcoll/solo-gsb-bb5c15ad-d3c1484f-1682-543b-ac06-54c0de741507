@@ -15,6 +15,13 @@
 409，任一越界则全部不落库；修订后参与者与公共位置按原先指向的台词
 身份重排——保留的台词跟随新位置，被删除的回退到最近仍保留的前一行，
 无前一行则置为 -1，且修订本身不产生推进记录。
+
+导演可校准公共位置（PUT /rooms/{room_id}/cursor，独立的 progress_epoch
+乐观锁）：校验代际与目标范围后允许前跳或回退，原子更新公共位置、递增
+progress_epoch 并清空全部参与者进度；旧代际的迟到或重试上报返回 409，
+不能再推进房间。目标位置与当前一致时为幂等空操作，代际不递增。演员
+上报必须携带当前 progress_epoch（/state 可查）。台本整体导入同样开启
+新代际，使重导前在途的旧上报全部失效。
 """
 
 from __future__ import annotations
@@ -28,7 +35,14 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Response
 
 from .db import connect, init_db
-from .schemas import ClockUpdate, EventReport, LinesImport, LinesPatch, RoomCreate
+from .schemas import (
+    ClockUpdate,
+    CursorUpdate,
+    EventReport,
+    LinesImport,
+    LinesPatch,
+    RoomCreate,
+)
 
 
 def _now() -> float:
@@ -44,7 +58,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="排练提词同步 API",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -127,6 +141,7 @@ def _room_payload(room) -> Dict[str, Any]:
         "offline_timeout_seconds": room["offline_timeout_seconds"],
         "public_position": room["public_position"],
         "revision": room["revision"],
+        "progress_epoch": room["progress_epoch"],
         "created_at": room["created_at"],
     }
 
@@ -183,6 +198,7 @@ def _state_payload(conn, room, now: float) -> Dict[str, Any]:
         "offline_timeout_seconds": room["offline_timeout_seconds"],
         "lines_count": lines_count,
         "revision": room["revision"],
+        "progress_epoch": room["progress_epoch"],
         "public_position": public_position,
         "current_line": current_line,
         "active_participants": participants,
@@ -251,7 +267,8 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
     """导入有序台词（整体替换），重置进度并开启新的台本版本。
 
     台本变化后旧的位置上报不再有意义，因此导入会重置公共位置、
-    参与者与推进历史；每次导入版本号（revision）递增。
+    参与者与推进历史；每次导入版本号（revision）递增，同时进度代际
+    （progress_epoch）递增，使重导前在途的旧代际上报全部失效（返回 409）。
     """
     conn = connect()
     try:
@@ -263,9 +280,14 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
             [(room_id, position, text) for position, text in enumerate(payload.lines)],
         )
         new_revision = room["revision"] + 1
+        new_progress_epoch = room["progress_epoch"] + 1
         conn.execute(
-            "UPDATE rooms SET public_position = -1, revision = ? WHERE id = ?",
-            (new_revision, room_id),
+            """
+            UPDATE rooms
+            SET public_position = -1, revision = ?, progress_epoch = ?
+            WHERE id = ?
+            """,
+            (new_revision, new_progress_epoch, room_id),
         )
         conn.execute("DELETE FROM participants WHERE room_id = ?", (room_id,))
         conn.execute("DELETE FROM advancements WHERE room_id = ?", (room_id,))
@@ -275,6 +297,7 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
             "lines_imported": len(payload.lines),
             "progress_reset": True,
             "revision": new_revision,
+            "progress_epoch": new_progress_epoch,
         }
     except Exception:
         conn.rollback()
@@ -438,6 +461,10 @@ def patch_lines(room_id: str, payload: LinesPatch) -> Dict[str, Any]:
 def report_event(room_id: str, event: EventReport) -> Dict[str, Any]:
     """演员上报已到达的台词位置。
 
+    上报必须携带当前 ``progress_epoch``（由 ``GET /state`` 获取）。导演
+    校准公共位置或台本整体重导会开启新代际；旧代际的迟到或重试事件返回
+    409，既不会被记录也不能重新推进房间。
+
     同一参与者的 ``seq`` 必须严格递增；小于等于已见序号的上报（重复或
     乱序）会被忽略并返回 ``applied: false``，不产生任何状态变化，因此
     重试是安全的。被接受的上报会刷新参与者的活跃时间，并触发一次公共
@@ -450,6 +477,14 @@ def report_event(room_id: str, event: EventReport) -> Dict[str, Any]:
         room = _get_room(conn, room_id)
         if room["paused"]:
             raise HTTPException(status_code=409, detail="排练已暂停：暂停期间拒绝位置上报")
+        if event.progress_epoch != room["progress_epoch"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"进度代际不匹配: progress_epoch={event.progress_epoch}, "
+                    f"当前 progress_epoch={room['progress_epoch']}"
+                ),
+            )
         lines_count = conn.execute(
             "SELECT COUNT(*) AS c FROM lines WHERE room_id = ?", (room_id,)
         ).fetchone()["c"]
@@ -487,6 +522,7 @@ def report_event(room_id: str, event: EventReport) -> Dict[str, Any]:
         return {
             "applied": applied,
             "duplicate": not applied,
+            "progress_epoch": fresh_room["progress_epoch"],
             "advancement": advancement,
             "state": _state_payload(conn, fresh_room, now),
         }
@@ -585,6 +621,107 @@ def update_clock(room_id: str, payload: ClockUpdate) -> Dict[str, Any]:
             "clock_version": fresh["clock_version"],
             "paused_at": fresh["paused_at"],
             "state": _state_payload(conn, fresh, now),
+        }
+    finally:
+        conn.close()
+
+
+@app.put("/rooms/{room_id}/cursor")
+def update_cursor(room_id: str, payload: CursorUpdate) -> Dict[str, Any]:
+    """导演校准公共位置（允许前跳或回退）。
+
+    目标位置与当前公共位置一致时为幂等空操作：直接返回当前状态，
+    ``progress_epoch`` 不递增（即便 ``expected_progress_epoch`` 已过期也
+    视为成功重试）。否则校验 ``expected_progress_epoch``，与当前代际不
+    一致返回 409、状态不变；目标位置越界（不在 ``[0, 台词总数)`` 内）
+    返回 422、状态不变。校验通过后在同一事务中：
+
+    1. 公共位置原子更新为目标位置（可以低于当前位置，即回退）；
+    2. ``progress_epoch`` 递增，旧代际在途的演员上报随即失效；
+    3. 清空全部参与者进度，使公共位置从干净状态重新由上报汇聚；
+    4. 写入一条推进记录，标明本次位置变化由导演校准触发。
+
+    校准不受暂停状态影响：暂停期间导演仍可调整公共位置；时钟状态
+    （paused / clock_version）不随校准改变。
+    """
+    conn = connect()
+    try:
+        # 先在无锁状态下判断是否为幂等空操作，并重试友好
+        room = _get_room(conn, room_id)
+        if room["public_position"] == payload.position:
+            return {
+                "changed": False,
+                "public_position": room["public_position"],
+                "progress_epoch": room["progress_epoch"],
+                "state": _state_payload(conn, room, _now()),
+            }
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            room = _get_room(conn, room_id)
+            now = _now()
+            if room["public_position"] == payload.position:
+                conn.commit()  # 并发下可能已被其他请求校准到同一位置
+                fresh = _get_room(conn, room_id)
+                return {
+                    "changed": False,
+                    "public_position": fresh["public_position"],
+                    "progress_epoch": fresh["progress_epoch"],
+                    "state": _state_payload(conn, fresh, now),
+                }
+            if payload.expected_progress_epoch != room["progress_epoch"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"进度代际不匹配: expected_progress_epoch="
+                        f"{payload.expected_progress_epoch}, 当前 progress_epoch="
+                        f"{room['progress_epoch']}"
+                    ),
+                )
+            lines_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM lines WHERE room_id = ?", (room_id,)
+            ).fetchone()["c"]
+            if lines_count == 0:
+                raise HTTPException(status_code=409, detail="房间尚未导入台词")
+            if payload.position >= lines_count:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"台词位置越界: position={payload.position}, "
+                        f"台词总数={lines_count}"
+                    ),
+                )
+
+            new_epoch = room["progress_epoch"] + 1
+            direction = "前跳" if payload.position > room["public_position"] else "回退"
+            reason = (
+                f"导演校准公共位置：{direction} {room['public_position']} → "
+                f"{payload.position}（progress_epoch {room['progress_epoch']} → {new_epoch}）"
+            )
+            conn.execute(
+                "UPDATE rooms SET public_position = ?, progress_epoch = ? WHERE id = ?",
+                (payload.position, new_epoch, room_id),
+            )
+            # 清空参与者进度：新代际从干净状态重新汇聚，旧代际上报一律失效
+            conn.execute("DELETE FROM participants WHERE room_id = ?", (room_id,))
+            conn.execute(
+                """
+                INSERT INTO advancements (room_id, position, reason, contributors, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (room_id, payload.position, reason, json.dumps([], ensure_ascii=False), now),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        fresh = _get_room(conn, room_id)
+        return {
+            "changed": True,
+            "public_position": fresh["public_position"],
+            "progress_epoch": fresh["progress_epoch"],
+            "state": _state_payload(conn, fresh, _now()),
         }
     finally:
         conn.close()

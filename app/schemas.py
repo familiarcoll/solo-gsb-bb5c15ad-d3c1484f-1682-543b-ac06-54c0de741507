@@ -38,11 +38,19 @@ class LinesImport(BaseModel):
 
 
 class EventReport(BaseModel):
-    """演员上报：参与者 ID、单调递增事件序号、已到达的台词位置。"""
+    """演员上报：参与者 ID、单调递增事件序号、已到达的台词位置。
+
+    ``progress_epoch`` 必须与房间当前进度代际一致；导演校准公共位置或台本
+    整体重导会开启新代际，旧代际的迟到/重试上报一律返回 409，不能再推进
+    房间。当前代际可通过 ``GET /rooms/{room_id}/state`` 查询。
+    """
 
     participant_id: str = Field(min_length=1, max_length=100)
     seq: int = Field(ge=0, description="该参与者单调递增的事件序号")
     position: int = Field(ge=0, description="已到达的台词位置（从 0 开始）")
+    progress_epoch: int = Field(
+        ge=0, description="客户端已知的进度代际；与当前不一致时返回 409"
+    )
 
 
 class LineOperation(BaseModel):
@@ -82,3 +90,19 @@ class ClockUpdate(BaseModel):
         ge=0, description="客户端已知的 clock_version；与当前不一致时返回 409"
     )
     paused: bool = Field(description="目标状态：true 暂停排练，false 恢复排练")
+
+
+class CursorUpdate(BaseModel):
+    """导演校准公共位置：携带客户端已知的进度代际做乐观并发控制。
+
+    允许前跳或回退；校验代际与目标范围后原子更新公共位置、递增
+    ``progress_epoch`` 并清空全部参与者进度，使旧代际的迟到/重试上报失效。
+    目标位置与当前一致时为幂等空操作，代际不递增。
+    """
+
+    expected_progress_epoch: int = Field(
+        ge=0, description="客户端已知的 progress_epoch；与当前不一致时返回 409"
+    )
+    position: int = Field(
+        ge=0, description="导演要校准到的目标台词位置（从 0 开始）"
+    )

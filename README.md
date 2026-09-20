@@ -2,11 +2,13 @@
 
 基于 **Python + FastAPI + SQLite** 的排练提词同步服务：房间导入有序台词并设置
 **推进人数** 与 **离线超时**；演员上报参与者 ID、单调递增事件序号和已到达的
-台词位置；服务幂等处理重复或乱序上报，公共位置只推进到达到指定人数的最高台词
-且 **绝不回退**；超时参与者自动退出推进人数计算。支持 **排练暂停/恢复**
-（冻结超时判定、暂停期间拒绝上报，恢复时扣除整段暂停时长）。台本支持
-**带版本号的增量修订**：按当前行号执行 insert/replace/delete，整批原子
-生效，参与者与公共位置按台词身份自动重排。
+台词位置（须携带当前**进度代际** `progress_epoch`）；服务幂等处理重复或乱序
+上报，公共位置只推进到达到指定人数的最高台词且 **绝不回退**；超时参与者自动
+退出推进人数计算。导演可随时**校准公共位置**（前跳或回退）：校验版本与范围后
+原子更新公共位置、递增进度代际并清空参与者进度，旧代际的迟到/重试上报返回
+409。支持 **排练暂停/恢复**（冻结超时判定、暂停期间拒绝上报，恢复时扣除整段
+暂停时长）。台本支持 **带版本号的增量修订**：按当前行号执行
+insert/replace/delete，整批原子生效，参与者与公共位置按台词身份自动重排。
 
 ## 快速启动（单条命令）
 
@@ -43,15 +45,16 @@ curl -X POST http://localhost:8000/rooms/demo/lines \
   -H 'Content-Type: application/json' \
   -d '{"lines":["周朴园：你姓什么？","鲁侍萍：我姓鲁。","周朴园：你是谁？"]}'
 
-# 3. 演员上报：参与者 ID + 单调递增序号 + 已到达的台词位置
+# 3. 演员上报：参与者 ID + 单调递增序号 + 已到达的台词位置 + 当前进度代际
+#    （台词导入后 progress_epoch 为 1；之后通过 /state 获取最新代际）
 curl -X POST http://localhost:8000/rooms/demo/events \
   -H 'Content-Type: application/json' \
-  -d '{"participant_id":"actor-zhou","seq":1,"position":2}'
+  -d '{"participant_id":"actor-zhou","seq":1,"position":2,"progress_epoch":1}'
 curl -X POST http://localhost:8000/rooms/demo/events \
   -H 'Content-Type: application/json' \
-  -d '{"participant_id":"actor-lu","seq":1,"position":2}'
+  -d '{"participant_id":"actor-lu","seq":1,"position":2,"progress_epoch":1}'
 
-# 4. 查询当前活跃成员、公共位置及推进原因
+# 4. 查询当前活跃成员、公共位置、进度代际及推进原因
 curl http://localhost:8000/rooms/demo/state
 
 # 5. 台本增量修订：基于 revision 1 整批执行插入/替换/删除（原子生效）
@@ -75,6 +78,14 @@ curl -X PUT http://localhost:8000/rooms/demo/clock \
 curl -X PUT http://localhost:8000/rooms/demo/clock \
   -H 'Content-Type: application/json' \
   -d '{"expected_clock_version":1,"paused":false}'
+
+# 8. 导演校准公共位置（可前跳或回退）：携带当前 progress_epoch 做乐观锁
+#    成功后公共位置变为 0、progress_epoch 递增、全部参与者进度被清空
+curl -X PUT http://localhost:8000/rooms/demo/cursor \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_progress_epoch":1,"position":0}'
+# → {"changed":true,"public_position":0,"progress_epoch":2,"state":{...}}
+# 此后演员必须携带 progress_epoch=2 上报；携带旧代际 1 的迟到/重试事件返回 409
 ```
 
 ## API 一览
@@ -86,8 +97,9 @@ curl -X PUT http://localhost:8000/rooms/demo/clock \
 | POST   | `/rooms/{room_id}/lines`        | 导入有序台词（整体替换，重置进度并开启新版本） |
 | GET    | `/rooms/{room_id}/lines`        | 查看台词（含当前 `revision`）              |
 | PATCH  | `/rooms/{room_id}/lines`        | 台本增量修订（版本校验 + 整批原子生效）    |
-| POST   | `/rooms/{room_id}/events`       | 演员上报位置（幂等；暂停时 409）           |
+| POST   | `/rooms/{room_id}/events`       | 演员上报位置（须携带 `progress_epoch`；旧代际/暂停时 409） |
 | PUT    | `/rooms/{room_id}/clock`        | 暂停/恢复排练（时钟版本乐观锁）            |
+| PUT    | `/rooms/{room_id}/cursor`       | 导演校准公共位置，可前跳/回退（进度代际乐观锁） |
 | GET    | `/rooms/{room_id}/state`        | 当前活跃成员、公共位置、最近一次推进原因   |
 | GET    | `/rooms/{room_id}/advancements` | 完整推进历史（含每次推进原因）             |
 | GET    | `/health`                       | 健康检查                                   |
@@ -97,6 +109,23 @@ curl -X PUT http://localhost:8000/rooms/demo/clock \
 - **幂等上报**：同一参与者的 `seq` 必须严格递增。重复（`seq` 相同）或乱序
   （`seq` 更小）的上报会被忽略，返回 `applied: false`，不产生任何状态变化，
   客户端可安全重试。
+- **进度代际（progress_epoch）**：演员上报必须携带当前 `progress_epoch`
+  （由 `/state` 获取；房间创建时为 0，首次导入台本后为 1）。导演校准公共
+  位置或台本整体重导都会开启新代际；**旧代际的延迟或重试事件返回 409**，
+  既不被记录也不能重新推进房间。`GET /rooms/{room_id}`、`/state` 以及上报
+  响应均返回当前代际。
+- **导演校准公共位置**（`PUT /rooms/{room_id}/cursor`，请求体
+  `{"expected_progress_epoch": <当前代际>, "position": <目标行号>}`）：
+  允许**前跳或回退**，与台本版本、时钟状态相互独立（暂停期间也可校准）。
+  - 目标位置与当前公共位置一致时为**幂等空操作**：返回当前状态、
+    `changed: false`，`progress_epoch` **不递增**（即使携带过期代际也视为
+    成功重试）；
+  - 目标不同时校验 `expected_progress_epoch`，与当前代际不一致 → **409**，
+    状态不变；房间尚未导入台词 → **409**；目标位置不在
+    `[0, 台词总数)` 内 → **422**，状态不变；
+  - 校验通过后在同一事务中原子完成：公共位置更新为目标位置（可低于当前
+    位置）、`progress_epoch` 递增、**清空全部参与者进度**（新代际从干净
+    状态重新汇聚），并在推进历史中写入一条“导演校准”记录。
 - **推进规则**：公共位置 = 活跃参与者中第 `advance_threshold` 高的位置，即
   “达到指定人数的最高台词”。活跃指在 `offline_timeout_seconds` 内有上报。
 - **绝不回退**：公共位置只升不降。参与者超时离线、演员自己回报更低位置，
@@ -120,14 +149,17 @@ curl -X PUT http://localhost:8000/rooms/demo/clock \
     状态与 `clock_version`。
 - **时钟状态字段**：`/state` 返回 `paused`（布尔）、`clock_version`
   （暂停/恢复每实际切换一次递增，初值 0）与 `paused_at`（本次暂停开始的
-  epoch 秒；运行中为 `null`）。
+  epoch 秒；运行中为 `null`）。时钟版本与进度代际互不影响。
 - **推进原因**：每次推进记录促成的参与者名单与可读原因，可在
-  `/state`（最近一次）与 `/advancements`（全部历史）中查询。
+  `/state`（最近一次）与 `/advancements`（全部历史）中查询。导演校准记录
+  的 `contributors` 为空数组、原因为“导演校准公共位置”。
 - **台本版本（revision）**：房间创建时为 0，每次整体导入或增量修订后递增；
   `GET /rooms`、`GET /rooms/{room_id}/lines` 与 `GET /rooms/{room_id}/state`
-  均返回当前版本。
+  均返回当前版本。revision 与 progress_epoch 相互独立：增量修订不改变
+  进度代际，导演校准不改变台本版本。
 - **台词导入**：整体替换台本并重置房间进度（公共位置、参与者、推进历史），
-  同时开启新版本（`revision` 递增）。
+  同时开启新版本（`revision` 递增）与新进度代际（`progress_epoch` 递增），
+  使重导前在途的旧代际上报全部失效。
 - **台本增量修订**：`PATCH /rooms/{room_id}/lines` 携带 `base_revision` 与一组
   按**当前行号**执行的 `insert` / `replace` / `delete` 操作，整批在事务中校验、
   原子生效：
